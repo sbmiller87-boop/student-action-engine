@@ -26,7 +26,7 @@ def check_password():
     return False
 
 if not check_password():
-    st.stop() # Stops the script here if not logged in
+    st.stop() 
 
 # ==========================================
 # 2. APP CONFIGURATION & AI SETUP
@@ -40,17 +40,15 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 # ==========================================
 # 3. DATA INGESTION (Google Sheets)
 # ==========================================
-@st.cache_data(ttl=600) # Caches data for 10 mins to save API calls
+@st.cache_data(ttl=600) 
 def load_sheet_data(sheet_url):
     """Converts a standard Google Sheets sharing link to a CSV export link and loads it."""
     csv_url = sheet_url.replace('/edit?usp=sharing', '/export?format=csv')
     return pd.read_csv(csv_url)
 
-# Replace this with your actual Google Sheet link (must be set to 'Anyone with the link can view' 
-# or use st.connection for strict private service accounts)
-SHEET_URL = "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?usp=sharing"
-
 try:
+    # Safely pulling the URL from the Streamlit Secrets vault!
+    SHEET_URL = st.secrets["urls"]["sheet_url"]
     df = load_sheet_data(SHEET_URL)
 except Exception as e:
     st.error(f"Error loading data: {e}")
@@ -61,13 +59,11 @@ except Exception as e:
 # ==========================================
 st.title("📊 Student Action & Insights Engine")
 
-# Top Row: Actionable Quick Filters
 st.subheader("⚡ Quick Action Lists")
 col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🚀 Generate Celebration List (High Growth)"):
-        # Example logic: Filter for top growth
         if 'Relative Growth' in df.columns:
             celebration_df = df[df['Relative Growth'] == 'High']
             st.dataframe(celebration_df, use_container_width=True)
@@ -75,7 +71,6 @@ with col1:
 
 with col2:
     if st.button("⚠️ Generate Intervention List (Low Attendance)"):
-        # Example logic: Filter for < 90% attendance
         if 'ClassPercentage' in df.columns:
             risk_df = df[df['ClassPercentage'] < 90]
             st.dataframe(risk_df, use_container_width=True)
@@ -83,12 +78,10 @@ with col2:
 
 st.divider()
 
-# Middle Row: Automated Box Plots (e.g., PAT Scores)
 st.subheader("📈 Cohort Distributions")
-if 'Year_Level' in df.columns and 'PAT_Score' in df.columns: # Adjust column names to match your sheet
+if 'Year_Level' in df.columns and 'PAT_Score' in df.columns: 
     fig = px.box(df, x="Year_Level", y="PAT_Score", color="Year_Level",
-                 title="PAT Score Distribution by Year Level",
-                 points="all") # Shows individual student dots next to the box
+                 title="PAT Score Distribution by Year Level", points="all") 
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("Ensure your sheet has 'Year_Level' and 'PAT_Score' columns to render the box plot.")
@@ -104,16 +97,12 @@ st.write("Ask the AI to filter, summarize, or identify specific student groups b
 user_query = st.chat_input("E.g., 'Which Year 9 students have stalled growth and attendance below 80%?'")
 
 if user_query:
-    # Display user query
     with st.chat_message("user"):
         st.write(user_query)
     
-    # Generate AI response ephemerally using the dataframe context
     with st.chat_message("assistant"):
         with st.spinner("Analyzing cohort data..."):
-            # We convert a snippet of the dataframe to markdown for the AI context
             data_context = df.to_markdown()
-            
             prompt = f"""
             You are a data analyst assistant for a school. 
             Analyze the following student dataset to answer the staff member's query.
@@ -124,6 +113,5 @@ if user_query:
             Dataset:
             {data_context}
             """
-            
             response = model.generate_content(prompt)
             st.write(response.text)

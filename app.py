@@ -1,11 +1,12 @@
 import hmac
 import json
 import re
+import time
 
 import pandas as pd
 import streamlit as st
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 # ==========================================
 # 1. SECURITY & AUTHENTICATION
@@ -38,6 +39,8 @@ client = genai.Client(api_key=st.secrets["api_keys"]["gemini_key"])
 # doesn't break each time Google retires one. Pin a specific model (e.g.
 # "gemini-3.8-flash") by setting [ai] model in secrets if you want stability.
 MODEL_NAME = st.secrets.get("ai", {}).get("model", "gemini-flash-latest")
+# Used automatically if the main model is overloaded (503/429). Override in secrets.
+FALLBACK_MODEL = st.secrets.get("ai", {}).get("fallback_model", "gemini-flash-lite-latest")
 
 # ==========================================
 # 3. DATA INGESTION (multiple sheets, any schema)
@@ -125,6 +128,26 @@ Sample rows:
 
 Question: {question}
 """
+
+
+
+def call_model(prompt: str) -> str:
+    """Call Gemini, retrying temporary overloads, then falling back to a lighter model."""
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+    transient = {429, 500, 502, 503, 504}
+    last_err = None
+    for model_name in dict.fromkeys([MODEL_NAME, FALLBACK_MODEL]):  # de-duplicated, ordered
+        for attempt in range(3):
+            try:
+                return client.models.generate_content(
+                    model=model_name, contents=prompt, config=config
+                ).text
+            except errors.APIError as e:
+                last_err = e
+                if getattr(e, "code", None) not in transient:
+                    raise  # real error (bad key, bad model name...) - don't retry
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+    raise last_err
 
 
 def extract_json(raw: str) -> dict:
@@ -227,14 +250,7 @@ if question:
                 sample=df.head(3).to_csv(index=False),
                 question=question,
             )
-            raw = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0,
-                ),
-            ).text
+            raw = call_model(prompt)
             plan = extract_json(raw)
             if "error" in plan:
                 turn["error"] = plan["error"]

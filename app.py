@@ -3,9 +3,9 @@ import json
 import re
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ==========================================
 # 1. SECURITY & AUTHENTICATION
@@ -17,7 +17,6 @@ def check_password() -> bool:
     st.title("🔒 Staff Data Portal")
     pw = st.text_input("Enter Staff Password", type="password")
     if st.button("Log In"):
-        # constant-time comparison
         if hmac.compare_digest(pw, st.secrets["passwords"]["staff_password"]):
             st.session_state["password_correct"] = True
             st.rerun()
@@ -32,17 +31,18 @@ if not check_password():
 # ==========================================
 # 2. CONFIG & AI SETUP
 # ==========================================
-st.set_page_config(page_title="Student Action Engine", layout="wide")
+st.set_page_config(page_title="Student Insights Assistant", layout="wide")
 
-genai.configure(api_key=st.secrets["api_keys"]["gemini_key"])
-MODEL_NAME = st.secrets.get("ai", {}).get("model", "gemini-2.5-flash")
-model = genai.GenerativeModel(MODEL_NAME)
+client = genai.Client(api_key=st.secrets["api_keys"]["gemini_key"])
+# "gemini-flash-latest" always points at the current Flash model, so the app
+# doesn't break each time Google retires one. Pin a specific model (e.g.
+# "gemini-3.8-flash") by setting [ai] model in secrets if you want stability.
+MODEL_NAME = st.secrets.get("ai", {}).get("model", "gemini-flash-latest")
 
 # ==========================================
 # 3. DATA INGESTION (multiple sheets, any schema)
 # ==========================================
 def to_csv_url(url: str) -> str:
-    """Turn any Google Sheets URL into a CSV export URL (keeps the tab's gid)."""
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not m:
         raise ValueError(f"Not a valid Google Sheets URL: {url}")
@@ -56,7 +56,6 @@ def load_sheet(url: str) -> pd.DataFrame:
     df = pd.read_csv(to_csv_url(url))
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all").dropna(axis=1, how="all")
-    # Convert columns that are mostly numeric (handles "85%", "1,200" etc.)
     for c in df.select_dtypes(include="object").columns:
         cleaned = df[c].astype(str).str.replace(r"[%,$]", "", regex=True).str.strip()
         num = pd.to_numeric(cleaned, errors="coerce")
@@ -66,7 +65,6 @@ def load_sheet(url: str) -> pd.DataFrame:
 
 
 def profile(df: pd.DataFrame) -> list[dict]:
-    """Compact schema description - this is what we send to the AI instead of the whole sheet."""
     cols = []
     for c in df.columns:
         s = df[c]
@@ -81,7 +79,7 @@ def profile(df: pd.DataFrame) -> list[dict]:
     return cols
 
 
-sheets = dict(st.secrets["sheets"])  # {"Display name": "https://docs.google.com/..."}
+sheets = dict(st.secrets["sheets"])
 if not sheets:
     st.error("No sheets configured in secrets.")
     st.stop()
@@ -92,6 +90,9 @@ with st.sidebar:
     if st.button("🔄 Refresh data"):
         st.cache_data.clear()
         st.rerun()
+    if st.button("🧹 Clear conversation"):
+        st.session_state["history"] = {}
+        st.rerun()
 
 try:
     df = load_sheet(sheets[sheet_name])
@@ -99,88 +100,9 @@ except Exception as e:
     st.error(f"Error loading '{sheet_name}': {e}")
     st.stop()
 
-num_cols = df.select_dtypes(include="number").columns.tolist()
-cat_cols = [c for c in df.columns if c not in num_cols and df[c].nunique() <= 30]
-
-st.title("📊 Student Action & Insights Engine")
-st.caption(f"{sheet_name}: {len(df):,} rows × {len(df.columns)} columns")
-
-with st.expander("Preview & column summary"):
-    st.dataframe(df.head(50), use_container_width=True)
-    st.dataframe(pd.DataFrame(profile(df)), use_container_width=True)
-
 # ==========================================
-# 4. QUICK ACTION LISTS (user picks the columns)
+# 4. AI ASSISTANT (first thing on the page)
 # ==========================================
-st.subheader("⚡ Quick Action Lists")
-OPS = {
-    "equals": lambda s, v: s.astype(str) == str(v),
-    "not equals": lambda s, v: s.astype(str) != str(v),
-    "contains": lambda s, v: s.astype(str).str.contains(str(v), case=False, na=False),
-    ">": lambda s, v: pd.to_numeric(s, errors="coerce") > float(v),
-    ">=": lambda s, v: pd.to_numeric(s, errors="coerce") >= float(v),
-    "<": lambda s, v: pd.to_numeric(s, errors="coerce") < float(v),
-    "<=": lambda s, v: pd.to_numeric(s, errors="coerce") <= float(v),
-}
-
-c1, c2, c3, c4 = st.columns([2, 1.2, 2, 1])
-col = c1.selectbox("Column", df.columns)
-op = c2.selectbox("Condition", list(OPS))
-if col in cat_cols and op in ("equals", "not equals"):
-    val = c3.selectbox("Value", sorted(df[col].dropna().astype(str).unique()))
-else:
-    val = c3.text_input("Value")
-list_name = c4.text_input("File name", "action_list")
-
-if st.button("Generate list") and val != "":
-    try:
-        result = df[OPS[op](df[col], val)]
-        st.write(f"**{len(result)} students match**")
-        st.dataframe(result, use_container_width=True)
-        st.download_button("Download CSV", result.to_csv(index=False), f"{list_name}.csv")
-    except Exception as e:
-        st.error(f"Couldn't apply that filter: {e}")
-
-st.divider()
-
-# ==========================================
-# 5. FLEXIBLE CHARTS
-# ==========================================
-st.subheader("📈 Explore")
-if num_cols:
-    g1, g2, g3 = st.columns(3)
-    y = g1.selectbox("Measure (Y)", num_cols)
-    x = g2.selectbox("Group by (X)", ["(none)"] + cat_cols)
-    kind = g3.selectbox("Chart", ["Box", "Histogram", "Bar (mean)"])
-    if kind == "Box":
-        fig = px.box(df, x=None if x == "(none)" else x, y=y,
-                     color=None if x == "(none)" else x, points="all")
-    elif kind == "Histogram":
-        fig = px.histogram(df, x=y, color=None if x == "(none)" else x)
-    else:
-        if x == "(none)":
-            st.info("Pick a 'Group by' column for a bar chart.")
-            fig = None
-        else:
-            fig = px.bar(df.groupby(x, as_index=False)[y].mean(), x=x, y=y)
-    if fig:
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("No numeric columns detected in this sheet.")
-
-st.divider()
-
-# ==========================================
-# 6. AI ASSISTANT (schema + query plan, not the whole dataset)
-# ==========================================
-# The model never receives the full sheet. It sees column names, types and a few
-# example values, returns a JSON query plan, and pandas executes it. That means:
-#   - works for any column set and any sheet size
-#   - no student rows leave the app beyond a small preview of the *result*
-#   - results are real rows, so the model can't invent students
-st.subheader("💬 Staff AI Assistant")
-st.write("Ask about the selected sheet, e.g. *'Which Year 9 students have attendance below 80%?'*")
-
 PLAN_PROMPT = """You translate a staff question into a JSON query plan for a pandas DataFrame.
 Only use columns from the schema. Respond with JSON only, no prose, in this shape:
 {{
@@ -205,6 +127,13 @@ Question: {question}
 """
 
 
+def extract_json(raw: str) -> dict:
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("The AI didn't return a query plan.")
+    return json.loads(raw[start:end + 1])
+
+
 def run_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
     out = df
     valid = set(df.columns)
@@ -216,9 +145,12 @@ def run_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
         if o in (">", ">=", "<", "<="):
             s = pd.to_numeric(s, errors="coerce")
             v = float(v)
+        is_text = not pd.api.types.is_numeric_dtype(s)
+        if o in ("in",) and not isinstance(v, list):
+            v = [v]
         masks = {
-            "==": lambda: s.astype(str).str.lower() == str(v).lower() if s.dtype == object else s == v,
-            "!=": lambda: s.astype(str).str.lower() != str(v).lower() if s.dtype == object else s != v,
+            "==": lambda: s.astype(str).str.lower() == str(v).lower() if is_text else s == float(v),
+            "!=": lambda: s.astype(str).str.lower() != str(v).lower() if is_text else s != float(v),
             ">": lambda: s > v, ">=": lambda: s >= v, "<": lambda: s < v, "<=": lambda: s <= v,
             "contains": lambda: s.astype(str).str.contains(str(v), case=False, na=False),
             "in": lambda: s.astype(str).str.lower().isin([str(x).lower() for x in v]),
@@ -251,34 +183,74 @@ def run_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
     return out
 
 
+st.title("💬 Student Insights Assistant")
+st.caption(f"{sheet_name} · {len(df):,} rows × {len(df.columns)} columns")
+
+history = st.session_state.setdefault("history", {}).setdefault(sheet_name, [])
+
+if not history:
+    st.write("Ask a question about this sheet, for example:")
+    st.markdown(
+        "- *Which Year 9 students have attendance below 80%?*\n"
+        "- *What's the average score by year level?*\n"
+        "- *List students with no recorded result.*"
+    )
+
+for i, turn in enumerate(history):
+    with st.chat_message("user"):
+        st.write(turn["question"])
+    with st.chat_message("assistant"):
+        if turn.get("error"):
+            st.error(turn["error"])
+            if turn.get("raw"):
+                with st.expander("Raw AI response"):
+                    st.code(turn["raw"])
+        else:
+            st.caption(f"Interpreted as: {turn['plan'].get('note', '')}")
+            st.write(f"**{len(turn['result'])} result(s)**")
+            st.dataframe(turn["result"], use_container_width=True)
+            if len(turn["result"]):
+                st.download_button("Download CSV", turn["result"].to_csv(index=False),
+                                   f"result_{i}.csv", key=f"dl_{sheet_name}_{i}")
+            with st.expander("Query plan (for checking)"):
+                st.json(turn["plan"])
+
 question = st.chat_input("Ask a question about this sheet...")
 
 if question:
-    with st.chat_message("user"):
-        st.write(question)
+    turn = {"question": question}
+    raw = None
+    with st.spinner("Working it out..."):
+        try:
+            prompt = PLAN_PROMPT.format(
+                schema=json.dumps(profile(df), default=str),
+                sample=df.head(3).to_csv(index=False),
+                question=question,
+            )
+            raw = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0,
+                ),
+            ).text
+            plan = extract_json(raw)
+            if "error" in plan:
+                turn["error"] = plan["error"]
+            else:
+                turn["plan"] = plan
+                turn["result"] = run_plan(df, plan)
+        except Exception as e:
+            turn["error"] = f"{type(e).__name__}: {e}"
+            turn["raw"] = raw
+    history.append(turn)
+    st.rerun()
 
-    with st.chat_message("assistant"):
-        with st.spinner("Working it out..."):
-            try:
-                prompt = PLAN_PROMPT.format(
-                    schema=json.dumps(profile(df), default=str),
-                    sample=df.head(3).to_csv(index=False),
-                    question=question,
-                )
-                raw = model.generate_content(prompt).text
-                plan = json.loads(re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.M).strip())
-
-                if "error" in plan:
-                    st.warning(plan["error"])
-                else:
-                    result = run_plan(df, plan)
-                    st.caption(f"Interpreted as: {plan.get('note', '')}")
-                    st.write(f"**{len(result)} result(s)**")
-                    st.dataframe(result, use_container_width=True)
-                    if len(result):
-                        st.download_button("Download CSV", result.to_csv(index=False),
-                                           "ai_result.csv", key=f"dl_{hash(question)}")
-                    with st.expander("Query plan (for checking)"):
-                        st.json(plan)
-            except Exception as e:
-                st.error(f"Couldn't answer that: {e}. Try rephrasing, or use the filters above.")
+# ==========================================
+# 5. DATA PREVIEW (collapsed, out of the way)
+# ==========================================
+st.divider()
+with st.expander("Preview sheet & column summary"):
+    st.dataframe(df.head(50), use_container_width=True)
+    st.dataframe(pd.DataFrame(profile(df)), use_container_width=True)

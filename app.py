@@ -12,6 +12,7 @@ from google.genai import errors, types
 
 import drive_sources as ds
 import freshness
+import privacy
 from analysis import clean_frame, profile, run_plan
 
 # ==========================================
@@ -40,9 +41,13 @@ if not check_password():
 # ==========================================
 st.set_page_config(page_title="Student Insights Assistant", layout="wide")
 
-client = genai.Client(api_key=st.secrets["api_keys"]["gemini_key"])
+client = genai.Client(api_key=st.secrets["api_keys"]["gemini_key"],
+                      http_options=types.HttpOptions(timeout=25000))  # ms: never hang the page
 MODEL_NAME = st.secrets.get("ai", {}).get("model", "gemini-flash-latest")
 FALLBACK_MODEL = st.secrets.get("ai", {}).get("fallback_model", "gemini-flash-lite-latest")
+_priv = dict(st.secrets.get("privacy", {}))
+HIDE_COLS = list(_priv.get("hide_columns", []))    # always keep these away from the AI
+ALLOW_COLS = list(_priv.get("allow_columns", []))  # never hide these (overrides detection)
 TZ = ZoneInfo(st.secrets.get("app", {}).get("timezone", "Australia/Melbourne"))
 
 
@@ -55,7 +60,7 @@ def call_model(prompt: str, as_json: bool = True) -> str:
     transient = {429, 500, 502, 503, 504}
     last_err = None
     for model_name in dict.fromkeys([MODEL_NAME, FALLBACK_MODEL]):
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 return client.models.generate_content(
                     model=model_name, contents=prompt, config=config).text
@@ -64,6 +69,10 @@ def call_model(prompt: str, as_json: bool = True) -> str:
                 if getattr(e, "code", None) not in transient:
                     raise
                 time.sleep(2 ** attempt)
+            except Exception as e:  # network timeouts etc.
+                if "timeout" not in type(e).__name__.lower():
+                    raise
+                last_err = e
     raise last_err
 
 
@@ -198,6 +207,20 @@ if not entries:
     st.stop()
 
 
+@st.cache_resource(ttl=600, show_spinner="Preparing privacy protections (first question only)...")
+def get_name_index(sig: tuple):
+    """Every student name/ID across all files, so names in a question can be masked before routing."""
+    idx, failed = set(), []
+    for e in entries[:MAX_COMBINED]:
+        try:
+            d, _, _ = load_one(e["kind"], e["key"], e["mime"], e["modified"] or "")
+        except Exception:
+            failed.append(e["label"])
+            continue
+        idx |= privacy.collect_values(d, privacy.detect_sensitive(d, HIDE_COLS, ALLOW_COLS))
+    return idx, failed, max(0, len(entries) - MAX_COMBINED)
+
+
 def catalog_text(items: list[dict]) -> str:
     limit = 30 if len(items) <= 60 else 12
     lines = []
@@ -231,7 +254,9 @@ Rules:
 """
 
 PLAN_PROMPT = """You turn a staff question about a school data sheet into a JSON analysis plan.
-Only use columns from the schema. If several files were combined, a "SourceFile" column says which
+Only use columns from the schema. Columns marked "hidden" hold personal data whose values you cannot
+see; you can still filter or group by them (use values from the question), and you must never ask for
+those values. If several files were combined, a "SourceFile" column says which
 file each row came from. Respond with JSON only:
 {{
   "intent": "table" | "aggregate" | "distribution",
@@ -298,33 +323,22 @@ NARRATE_RULE = ("3 to 6 short markdown bullet points: what the results show, and
                 "teaching different cohorts). Frame findings as 'worth a look', never as accusations about a "
                 "person. Plain English, no preamble, no headings.")
 
-STARTER_PROMPT = """Here are the data files available to school staff (id | name | source | last edited | columns):
-{catalog}
-
-Write 4 varied example questions staff could ask, in natural language, that these files can answer
-(e.g. a distribution/consistency check, a comparison, a count or average, a list of students to follow up).
-Respond with JSON only: {{"starters": ["...", "...", "...", "..."]}}"""
-
-FALLBACK_STARTERS = [
-    "How are the marks distributed, and is anything inconsistent?",
-    "What's the average result per task?",
-    "Which students have a missing result?",
-    "Compare results across year levels.",
-]
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_starters(catalog: str) -> list[str]:
-    try:
-        r = extract_json(call_model(STARTER_PROMPT.format(catalog=catalog)))
-        s = [x for x in r.get("starters", []) if isinstance(x, str)][:4]
-        return s or FALLBACK_STARTERS
-    except Exception:
-        return FALLBACK_STARTERS
+def get_starters(items: list[dict]) -> list[str]:
+    """Example questions built locally from file names. No AI call, so the page never waits on Gemini."""
+    labels = [e["label"].split("/")[-1] for e in items[:2]]
+    a_, b_ = labels[0], labels[-1]
+    return [
+        f"How are the results distributed in {a_}, and is anything inconsistent?",
+        f"What's the average result per task in {b_}?",
+        f"Which students have a missing result in {a_}?",
+        "Compare results across teachers.",
+    ]
 
 
 def history_text(turns: list[dict]) -> str:
-    lines = [f"Q: {t['question']} -> {t['plan'].get('note', '')}" for t in turns[-3:] if t.get("plan")]
+    """Previous questions for follow-ups. Uses the scrubbed versions, never the names as typed."""
+    lines = [f"Q: {t.get('question_ai') or t['question']} -> {t.get('note_ai') or t['plan'].get('note', '')}"
+             for t in turns[-3:] if t.get("plan")]
     return "\n".join(lines) or "(none yet)"
 
 
@@ -377,6 +391,9 @@ def ask(q: str):
 with st.sidebar:
     st.header("Data")
     st.caption(f"{len(entries)} file(s) available. Just ask; the assistant picks the right one.")
+    st.caption("🔒 Student names, IDs and similar personal columns are detected automatically and "
+               "never sent to the AI. Names typed into questions are swapped for placeholders first "
+               "(misspelled names may not be caught).")
     with st.expander("What's available"):
         for e in entries:
             mod = freshness.parse(e["modified"])
@@ -402,7 +419,7 @@ history: list[dict] = st.session_state.setdefault("history", [])
 
 if not history:
     st.write("Ask anything about your school data. Try one of these:")
-    for k, s in enumerate(get_starters(catalog_text(entries))):
+    for k, s in enumerate(get_starters(entries)):
         st.button(s, key=f"starter_{k}", on_click=ask, args=(s,))
 
 for i, turn in enumerate(history):
@@ -421,6 +438,14 @@ for i, turn in enumerate(history):
                 used += f" and {len(turn['metas']) - 3} more"
             st.caption(f"📂 Using: {used}" + (f" ({turn['reason']})" if turn.get("reason") else ""))
             st.caption(fresh["headline"])
+            if turn.get("hidden"):
+                st.caption("🔒 Kept from the AI (values never sent): " + ", ".join(turn["hidden"][:8])
+                           + (f" +{len(turn['hidden']) - 8} more" if len(turn["hidden"]) > 8 else ""))
+            if turn.get("masked"):
+                st.caption(f"🔒 {turn['masked']} student name/ID in your question was replaced with a "
+                           "placeholder before reaching the AI.")
+            if turn.get("privacy_note"):
+                st.caption("⚠️ " + turn["privacy_note"])
             st.caption(f"Interpreted as: {plan.get('note', '')}")
             if turn.get("narrative"):
                 st.markdown(turn["narrative"])
@@ -461,26 +486,40 @@ if question:
     turn, raw = {"question": question}, None
     with st.spinner("Working on it..."):
         try:
-            chosen, reason = choose_entries(question, history)
+            # Step 0: mask names/IDs in the question BEFORE any AI call (routing included).
+            index, failed, over = get_name_index(tuple((e["id"], e["modified"] or "") for e in entries))
+            q_ai, name_map = privacy.scrub(question, index, privacy.vocab_words(entries))
+            turn.update(question_ai=q_ai, masked=len(name_map))
+            if failed or over:
+                n = len(failed) + over
+                turn["privacy_note"] = (f"{n} file(s) couldn't be checked for student names, so names that "
+                                        "only appear in those files weren't masked.")
+
+            chosen, reason = choose_entries(q_ai, history)
             df, prof, metas, skipped = load_selection(chosen)
-            turn.update(entry_ids=[e["id"] for e in chosen], reason=reason, metas=metas, skipped=skipped,
-                        fresh=freshness.summarize(metas, TZ))
+            hidden = privacy.detect_sensitive(df, HIDE_COLS, ALLOW_COLS)
+            turn.update(hidden=sorted(map(str, hidden)), entry_ids=[e["id"] for e in chosen], reason=reason,
+                        metas=metas, skipped=skipped, fresh=freshness.summarize(metas, TZ))
 
             raw = call_model(PLAN_PROMPT.format(
                 history=history_text(history),
-                schema=json.dumps(prof, default=str),
-                sample=df.head(3).to_csv(index=False),
-                question=question,
+                schema=json.dumps(privacy.safe_profile(prof, hidden), default=str),
+                sample=privacy.safe_sample(df, hidden),
+                question=q_ai,
             ))
-            plan = extract_json(raw)
+            plan_ai = extract_json(raw)                      # what the AI said (placeholders)
+            turn["note_ai"] = str(plan_ai.get("note", ""))
+            plan = extract_json(privacy.unscrub(raw, name_map, json_safe=True))  # real values, local use only
             if "error" in plan:
-                turn["error"] = plan["error"]
+                turn["error"] = privacy.unscrub(str(plan["error"]), name_map)
             else:
                 turn["plan"] = plan
-                turn["out"] = run_plan(df, plan)
-                turn["narrative"], turn["followups"] = wrapup(question, plan, turn["out"], list(df.columns))
+                turn["out"] = run_plan(df, plan, hidden)
+                narr, follow = wrapup(q_ai, plan_ai, turn["out"], list(df.columns))
+                turn["narrative"] = privacy.unscrub(narr, name_map)
+                turn["followups"] = [privacy.unscrub(f, name_map) for f in follow]
         except Exception as e:
             turn["error"] = f"{type(e).__name__}: {e}"
-            turn["raw"] = raw
+            turn["raw"] = None  # raw AI text may hold placeholders only, but never needed for display
     history.append(turn)
     st.rerun()

@@ -17,6 +17,20 @@ def numeric_view(s: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce")
 
 
+def clean_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Tidy a freshly loaded sheet: trim headers, drop empty rows/cols, convert fully-numeric text columns."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+    # Only convert a text column to numbers if EVERY value parses. Mixed columns
+    # (e.g. marks plus 'Abs') stay as text so no entries are lost.
+    for c in [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]:
+        nonnull = df[c].notna().sum()
+        if nonnull and numeric_view(df[c]).notna().sum() == nonnull:
+            df[c] = numeric_view(df[c])
+    return df.reset_index(drop=True)  # unique index is required by the group comparisons
+
+
 def profile(df: pd.DataFrame) -> list[dict]:
     """Compact schema description sent to the AI instead of the whole sheet."""
     cols = []

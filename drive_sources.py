@@ -111,3 +111,6 @@ def read_file(drive, sheets, f: dict, tab: str | None = None) -> pd.DataFrame:
     if f["mimeType"] == GSHEET:
         return read_gsheet(sheets, f["id"], tab)
     return read_upload(drive, f["id"], f["mimeType"])
+
+
+VERSION = 6  # bump together with app.py REQUIRED_VERSION so stale copies are caught at startup

@@ -217,3 +217,6 @@ def restrict_to_cohort(df: pd.DataFrame, cohort: pd.DataFrame):
         return k.agg("|".join, axis=1)
 
     return df.loc[key(df).isin(set(key(cohort))).reindex(df.index, fill_value=False)], keys
+
+
+VERSION = 6  # bump together with app.py REQUIRED_VERSION so stale copies are caught at startup

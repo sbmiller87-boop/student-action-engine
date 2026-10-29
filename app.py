@@ -2,13 +2,17 @@ import hmac
 import json
 import re
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 from google import genai
 from google.genai import errors, types
 
-from analysis import numeric_view, profile, run_plan
+import drive_sources as ds
+import freshness
+from analysis import clean_frame, profile, run_plan
 
 # ==========================================
 # 1. SECURITY & AUTHENTICATION
@@ -39,6 +43,7 @@ st.set_page_config(page_title="Student Insights Assistant", layout="wide")
 client = genai.Client(api_key=st.secrets["api_keys"]["gemini_key"])
 MODEL_NAME = st.secrets.get("ai", {}).get("model", "gemini-flash-latest")
 FALLBACK_MODEL = st.secrets.get("ai", {}).get("fallback_model", "gemini-flash-lite-latest")
+TZ = ZoneInfo(st.secrets.get("app", {}).get("timezone", "Australia/Melbourne"))
 
 
 def call_model(prompt: str, as_json: bool = True) -> str:
@@ -65,13 +70,19 @@ def call_model(prompt: str, as_json: bool = True) -> str:
 def extract_json(raw: str) -> dict:
     start, end = raw.find("{"), raw.rfind("}")
     if start == -1 or end == -1:
-        raise ValueError("The AI didn't return a query plan.")
+        raise ValueError("The AI didn't return valid JSON.")
     return json.loads(raw[start:end + 1])
 
 
 # ==========================================
-# 3. DATA INGESTION (multiple sheets, any schema)
+# 3. DATA CATALOG & LOADING (links and/or private Drive folders)
 # ==========================================
+link_sheets = dict(st.secrets.get("sheets", {}))
+folders = dict(st.secrets.get("folders", {}))
+MAX_HEADER_PEEKS = 60   # how many Google Sheets get their column names read for routing
+MAX_COMBINED = 100      # most files combined for one question
+
+
 def to_csv_url(url: str) -> str:
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not m:
@@ -81,47 +92,147 @@ def to_csv_url(url: str) -> str:
     return out + (f"&gid={gid.group(1)}" if gid else "")
 
 
-@st.cache_data(ttl=600, show_spinner="Loading sheet...")
-def load_sheet(url: str) -> pd.DataFrame:
-    df = pd.read_csv(to_csv_url(url))
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(how="all").dropna(axis=1, how="all")
-    # Only convert a text column to numbers if EVERY value parses. Mixed columns
-    # (e.g. marks plus 'Abs') stay as text so no entries are lost; the analysis
-    # code handles the numeric view itself.
-    for c in [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]:
-        nonnull = df[c].notna().sum()
-        if nonnull and numeric_view(df[c]).notna().sum() == nonnull:
-            df[c] = numeric_view(df[c])
-    return df
+@st.cache_resource
+def get_services():
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Add a [gcp_service_account] section to your Streamlit secrets to use Drive folders.")
+    return ds.build_services(dict(st.secrets["gcp_service_account"]))
 
 
-sheets = dict(st.secrets["sheets"])
-if not sheets:
-    st.error("No sheets configured in secrets.")
+@st.cache_data(ttl=300, show_spinner="Checking what data is available...")
+def build_catalog() -> tuple[list[dict], list[str]]:
+    """Lightweight list of every available file (name, edit time, column names). No data is loaded."""
+    entries, problems = [], []
+    for name, url in link_sheets.items():
+        try:
+            cols = [str(c) for c in pd.read_csv(to_csv_url(url), nrows=0).columns]
+        except Exception as e:
+            cols = None
+            problems.append(f"{name}: {type(e).__name__}")
+        entries.append(dict(id=f"link:{name}", label=name, source="Sheet link", kind="link",
+                            key=url, mime="", modified=None, columns=cols))
+    if folders:
+        try:
+            drive, sheets = get_services()
+        except Exception as e:
+            problems.append(f"Drive folders unavailable: {e}")
+        else:
+            peeks = 0
+            for fname, ref in folders.items():
+                try:
+                    files = ds.list_files(drive, ds.folder_id_from(ref))
+                except Exception as e:
+                    problems.append(f"Folder '{fname}': {type(e).__name__}: {e}")
+                    continue
+                for f in files:
+                    cols = None
+                    if f["mimeType"] == ds.GSHEET and peeks < MAX_HEADER_PEEKS:
+                        peeks += 1
+                        try:
+                            cols = ds.peek_columns(sheets, f["id"])
+                        except Exception:
+                            pass
+                    entries.append(dict(id=f"drive:{f['id']}", label=f["path"], source=fname, kind="drive",
+                                        key=f["id"], mime=f["mimeType"], modified=f["modifiedTime"], columns=cols))
+    return entries, problems
+
+
+# cache_resource (not cache_data) so big DataFrames aren't copied on every question.
+# They are treated as read-only everywhere.
+@st.cache_resource(ttl=600, show_spinner="Loading data...")
+def load_one(kind: str, key: str, mime: str, modified: str):
+    if kind == "link":
+        raw = pd.read_csv(to_csv_url(key))
+    else:
+        drive, sheets = get_services()
+        raw = ds.read_file(drive, sheets, {"id": key, "mimeType": mime})
+    df = clean_frame(raw)
+    return df, datetime.now(timezone.utc).isoformat(), profile(df)
+
+
+@st.cache_resource(ttl=600, show_spinner="Combining files...")
+def combine(parts: tuple):
+    """parts: tuple of (kind, key, mime, modified, label). Adds a SourceFile column."""
+    frames = []
+    for kind, key, mime, modified, label in parts:
+        d, _, _ = load_one(kind, key, mime, modified)
+        d = d.copy()
+        d.insert(0, "SourceFile", label)
+        frames.append(d)
+    df = clean_frame(pd.concat(frames, ignore_index=True, sort=False))
+    return df, profile(df)
+
+
+def load_selection(chosen: list[dict]):
+    """Load the chosen catalog entries. Returns (df, profile, metas, skipped)."""
+    ok, metas, skipped = [], [], []
+    for e in chosen[:MAX_COMBINED]:
+        try:
+            d, fetched, _ = load_one(e["kind"], e["key"], e["mime"], e["modified"] or "")
+        except Exception as ex:
+            skipped.append(f"{e['label']}: {type(ex).__name__}")
+            continue
+        if d.empty:
+            skipped.append(f"{e['label']}: empty")
+            continue
+        ok.append(e)
+        metas.append({"label": e["label"], "modified": e["modified"], "fetched_at": fetched})
+    if len(chosen) > MAX_COMBINED:
+        skipped.append(f"{len(chosen) - MAX_COMBINED} more files not loaded (limit {MAX_COMBINED}).")
+    if not ok:
+        raise ValueError("None of the matching files could be read.")
+    if len(ok) == 1:
+        e = ok[0]
+        df, _, prof = load_one(e["kind"], e["key"], e["mime"], e["modified"] or "")
+    else:
+        df, prof = combine(tuple((e["kind"], e["key"], e["mime"], e["modified"] or "", e["label"]) for e in ok))
+    return df, prof, metas, skipped
+
+
+entries, catalog_problems = build_catalog()
+if not entries:
+    st.error("No data found. Add a [sheets] and/or [folders] section to your Streamlit secrets, "
+             "and check the folder is shared with the service account.")
+    for p in catalog_problems:
+        st.warning(p)
     st.stop()
 
-with st.sidebar:
-    st.header("Data source")
-    sheet_name = st.selectbox("Sheet", list(sheets))
-    if st.button("🔄 Refresh data"):
-        st.cache_data.clear()
-        st.rerun()
-    if st.button("🧹 Clear conversation"):
-        st.session_state["history"] = {}
-        st.rerun()
 
-try:
-    df = load_sheet(sheets[sheet_name])
-except Exception as e:
-    st.error(f"Error loading '{sheet_name}': {e}")
-    st.stop()
+def catalog_text(items: list[dict]) -> str:
+    limit = 30 if len(items) <= 60 else 12
+    lines = []
+    for e in items:
+        cols = ", ".join(c[:25] for c in (e["columns"] or [])[:limit]) or "(columns unknown)"
+        mod = freshness.parse(e["modified"])
+        edited = freshness.when(mod, TZ) if mod else "unknown"
+        lines.append(f"{e['id']} | {e['label']} | {e['source']} | edited {edited} | {cols}")
+    return "\n".join(lines)
+
 
 # ==========================================
 # 4. PROMPTS
 # ==========================================
+ROUTER_PROMPT = """You choose which data files are needed to answer a staff question about school data.
+
+Files (id | name | source | last edited | columns):
+{catalog}
+
+Files used for the previous question in this conversation: {previous}
+
+Question: {question}
+
+Respond with JSON only: {{"dataset_ids": ["id", ...] or "all", "reason": "short phrase"}}
+Rules:
+- Choose the fewest files that can answer the question (maximum 10).
+- Use "all" only if the question is clearly about every file or the whole school across files.
+- For a follow-up question, keep using the previous files unless the question points elsewhere.
+- File names often contain the year level, subject or term; match on those and on column names.
+- If it's ambiguous, pick the most plausible file(s) and say so in "reason".
+"""
+
 PLAN_PROMPT = """You turn a staff question about a school data sheet into a JSON analysis plan.
-Only use columns from the schema. Respond with JSON only:
+Only use columns from the schema. If several files were combined, a "SourceFile" column says which
+file each row came from. Respond with JSON only:
 {{
   "intent": "table" | "aggregate" | "distribution",
   "filters": [{{"column": str, "op": "==|!=|>|>=|<|<=|contains|in|isnull|notnull", "value": any}}],
@@ -164,18 +275,52 @@ Sample rows:
 Question: {question}
 """
 
-NARRATE_PROMPT = """You are a data analyst briefing a school leader. Below are computed results.
-Use only numbers that appear in them; never invent figures.
+WRAPUP_PROMPT = """You are a data analyst assistant for school staff. Use only numbers that appear below; never invent figures.
 
 Question: {question}
+Analysis type: {intent}
+Columns available: {columns}
 
+Computed results:
 {summary}
 
-Write 3 to 6 short bullet points covering: what the distribution looks like, and anything
-inconsistent or worth a closer look, each backed by a specific number. Then one final line of
-caveats (for example small samples, marks possibly on different scales across tasks, peers possibly
-teaching different cohorts). Frame findings as "worth a look" rather than accusations about a person.
-Plain English, no preamble, no headings."""
+Respond with JSON only: {{"commentary": "...", "followups": ["...", "...", "..."]}}
+
+commentary: {commentary_rule}
+followups: exactly 3 short follow-up questions staff could ask next. Write each as a natural chat message
+that makes sense on its own (name the group, file or column; never say "it" or "them"), answerable from
+the available columns, and varied: one to drill down, one to compare, one to check data quality or consistency.
+"""
+
+NARRATE_RULE = ("3 to 6 short markdown bullet points: what the results show, and anything inconsistent or "
+                "worth a closer look, each backed by a specific number. Then one final line of caveats "
+                "(for example small samples, marks possibly on different scales across tasks, peers possibly "
+                "teaching different cohorts). Frame findings as 'worth a look', never as accusations about a "
+                "person. Plain English, no preamble, no headings.")
+
+STARTER_PROMPT = """Here are the data files available to school staff (id | name | source | last edited | columns):
+{catalog}
+
+Write 4 varied example questions staff could ask, in natural language, that these files can answer
+(e.g. a distribution/consistency check, a comparison, a count or average, a list of students to follow up).
+Respond with JSON only: {{"starters": ["...", "...", "...", "..."]}}"""
+
+FALLBACK_STARTERS = [
+    "How are the marks distributed, and is anything inconsistent?",
+    "What's the average result per task?",
+    "Which students have a missing result?",
+    "Compare results across year levels.",
+]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_starters(catalog: str) -> list[str]:
+    try:
+        r = extract_json(call_model(STARTER_PROMPT.format(catalog=catalog)))
+        s = [x for x in r.get("starters", []) if isinstance(x, str)][:4]
+        return s or FALLBACK_STARTERS
+    except Exception:
+        return FALLBACK_STARTERS
 
 
 def history_text(turns: list[dict]) -> str:
@@ -183,22 +328,82 @@ def history_text(turns: list[dict]) -> str:
     return "\n".join(lines) or "(none yet)"
 
 
+def choose_entries(question: str, history: list[dict]) -> tuple[list[dict], str]:
+    if len(entries) == 1:
+        return entries, ""
+    by_id = {e["id"]: e for e in entries}
+    prev_ids = next((t["entry_ids"] for t in reversed(history) if t.get("entry_ids")), [])
+    prev = ", ".join(prev_ids) or "(none)"
+    r = extract_json(call_model(ROUTER_PROMPT.format(
+        catalog=catalog_text(entries), previous=prev, question=question)))
+    ids = r.get("dataset_ids")
+    if ids == "all" or (isinstance(ids, list) and "all" in ids):
+        chosen = list(entries)
+    else:
+        chosen = [by_id[i] for i in (ids if isinstance(ids, list) else [ids]) if i in by_id][:10]
+    if not chosen:  # never guess: analysing the wrong file is worse than asking
+        names = ", ".join(e["label"] for e in entries[:20])
+        raise ValueError("I couldn't tell which data you meant. Try mentioning a file, year level or "
+                         f"subject. Available: {names}")
+    return chosen, str(r.get("reason", ""))
+
+
+def wrapup(question: str, plan: dict, out: dict, columns: list[str]) -> tuple[str, list[str]]:
+    """One call returns commentary (for analyses) and 3 follow-up ideas. Never fails the answer."""
+    intent = plan.get("intent", "table")
+    narrate = intent in ("distribution", "aggregate") and out["summary"]
+    if narrate:
+        summary, rule = out["summary"], NARRATE_RULE
+    else:  # listings: send only the shape, never student rows
+        summary = f"A table of {len(out['result'])} rows with columns: {', '.join(map(str, out['result'].columns))}."
+        rule = 'an empty string ("").'
+    try:
+        r = extract_json(call_model(WRAPUP_PROMPT.format(
+            question=question, intent=intent, columns=", ".join(columns[:60]),
+            summary=summary, commentary_rule=rule)))
+        follow = [x for x in r.get("followups", []) if isinstance(x, str)][:3]
+        return (r.get("commentary") or "") if narrate else "", follow
+    except Exception:
+        return "", []
+
+
 # ==========================================
-# 5. AI ASSISTANT
+# 5. SIDEBAR (minimal)
+# ==========================================
+def ask(q: str):
+    st.session_state["pending_q"] = q
+
+
+with st.sidebar:
+    st.header("Data")
+    st.caption(f"{len(entries)} file(s) available. Just ask; the assistant picks the right one.")
+    with st.expander("What's available"):
+        for e in entries:
+            mod = freshness.parse(e["modified"])
+            now_ = datetime.now(timezone.utc)
+            when_ = f"edited {freshness.ago(mod, now_)}" if mod else "edit time n/a"
+            st.markdown(f"- **{e['label']}** · {when_}")
+    for p in catalog_problems:
+        st.warning(p)
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    if st.button("🧹 Clear conversation"):
+        st.session_state["history"] = []
+        st.rerun()
+
+# ==========================================
+# 6. CHAT
 # ==========================================
 st.title("💬 Student Insights Assistant")
-st.caption(f"{sheet_name} · {len(df):,} rows × {len(df.columns)} columns")
 
-history = st.session_state.setdefault("history", {}).setdefault(sheet_name, [])
+history: list[dict] = st.session_state.setdefault("history", [])
 
 if not history:
-    st.write("Ask a question about this sheet, for example:")
-    st.markdown(
-        "- *How are teacher ABC's marks distributed, and is anything inconsistent?*\n"
-        "- *Compare Year 9 maths marks with the rest of the school.*\n"
-        "- *What's the average result per task?*\n"
-        "- *List students with a missing result in Science.*"
-    )
+    st.write("Ask anything about your school data. Try one of these:")
+    for k, s in enumerate(get_starters(catalog_text(entries))):
+        st.button(s, key=f"starter_{k}", on_click=ask, args=(s,))
 
 for i, turn in enumerate(history):
     with st.chat_message("user"):
@@ -209,70 +414,73 @@ for i, turn in enumerate(history):
             if turn.get("raw"):
                 with st.expander("Raw AI response"):
                     st.code(turn["raw"])
-            continue
+        else:
+            out, plan, fresh = turn["out"], turn["plan"], turn["fresh"]
+            used = ", ".join(m["label"] for m in turn["metas"][:3])
+            if len(turn["metas"]) > 3:
+                used += f" and {len(turn['metas']) - 3} more"
+            st.caption(f"📂 Using: {used}" + (f" ({turn['reason']})" if turn.get("reason") else ""))
+            st.caption(fresh["headline"])
+            st.caption(f"Interpreted as: {plan.get('note', '')}")
+            if turn.get("narrative"):
+                st.markdown(turn["narrative"])
+            for n in out["notes"]:
+                st.caption(f"ℹ️ {n}")
+            for j, fig in enumerate(out["figs"]):
+                st.plotly_chart(fig, use_container_width=True, key=f"fig_{i}_{j}")
 
-        out, plan = turn["out"], turn["plan"]
-        st.caption(f"Interpreted as: {plan.get('note', '')}")
-        if turn.get("narrative"):
-            st.markdown(turn["narrative"])
-        for n in out["notes"]:
-            st.caption(f"ℹ️ {n}")
-        for j, fig in enumerate(out["figs"]):
-            st.plotly_chart(fig, use_container_width=True, key=f"fig_{sheet_name}_{i}_{j}")
-
-        if plan.get("intent", "table") == "table" or not out["figs"]:
-            st.write(f"**{len(out['result'])} result(s)**")
-            st.dataframe(out["result"], use_container_width=True)
-        with st.expander("Details: tables, flags and query plan"):
-            if out["flags"]:
-                st.markdown("**Automatic flags**\n\n" + "\n".join(f"- {f}" for f in out["flags"]))
-            if out["stats"] is not None:
-                st.dataframe(out["stats"], use_container_width=True)
-            if out["levels"] is not None:
-                st.dataframe(out["levels"], use_container_width=True)
-            if plan.get("intent", "table") != "table" and out["figs"]:
+            if plan.get("intent", "table") == "table" or not out["figs"]:
+                st.write(f"**{len(out['result'])} result(s)**")
                 st.dataframe(out["result"], use_container_width=True)
-            st.json(plan)
-        if len(out["result"]):
-            st.download_button("Download table (CSV)", out["result"].to_csv(index=False),
-                               f"result_{i}.csv", key=f"dl_{sheet_name}_{i}")
+            with st.expander("Details: data sources, tables, flags and query plan"):
+                st.markdown("**Data sources & timeliness**")
+                st.dataframe(pd.DataFrame(fresh["rows"]), use_container_width=True)
+                if turn.get("skipped"):
+                    st.markdown("**Skipped files**\n\n" + "\n".join(f"- {x}" for x in turn["skipped"]))
+                if out["flags"]:
+                    st.markdown("**Automatic flags**\n\n" + "\n".join(f"- {f}" for f in out["flags"]))
+                if out["stats"] is not None:
+                    st.dataframe(out["stats"], use_container_width=True)
+                if out["levels"] is not None:
+                    st.dataframe(out["levels"], use_container_width=True)
+                if plan.get("intent", "table") != "table" and out["figs"]:
+                    st.dataframe(out["result"], use_container_width=True)
+                st.json(plan)
+            if len(out["result"]):
+                st.download_button("Download table (CSV)", out["result"].to_csv(index=False),
+                                   f"result_{i}.csv", key=f"dl_{i}")
 
-question = st.chat_input("Ask a question about this sheet...")
+            if i == len(history) - 1 and turn.get("followups"):
+                st.markdown("**Ideas to explore next**")
+                for k, f in enumerate(turn["followups"]):
+                    st.button(f, key=f"fu_{i}_{k}", on_click=ask, args=(f,))
+
+question = st.chat_input("Ask about your school data...") or st.session_state.pop("pending_q", None)
 
 if question:
     turn, raw = {"question": question}, None
-    with st.spinner("Analysing..."):
+    with st.spinner("Working on it..."):
         try:
-            prompt = PLAN_PROMPT.format(
+            chosen, reason = choose_entries(question, history)
+            df, prof, metas, skipped = load_selection(chosen)
+            turn.update(entry_ids=[e["id"] for e in chosen], reason=reason, metas=metas, skipped=skipped,
+                        fresh=freshness.summarize(metas, TZ))
+
+            raw = call_model(PLAN_PROMPT.format(
                 history=history_text(history),
-                schema=json.dumps(profile(df), default=str),
+                schema=json.dumps(prof, default=str),
                 sample=df.head(3).to_csv(index=False),
                 question=question,
-            )
-            raw = call_model(prompt)
+            ))
             plan = extract_json(raw)
             if "error" in plan:
                 turn["error"] = plan["error"]
             else:
                 turn["plan"] = plan
                 turn["out"] = run_plan(df, plan)
-                if turn["out"]["summary"] and plan.get("intent") in ("distribution", "aggregate"):
-                    try:
-                        turn["narrative"] = call_model(
-                            NARRATE_PROMPT.format(question=question, summary=turn["out"]["summary"]),
-                            as_json=False)
-                    except Exception as e:  # commentary is optional; keep charts/tables
-                        turn["narrative"] = f"*(Couldn't generate commentary: {type(e).__name__})*"
+                turn["narrative"], turn["followups"] = wrapup(question, plan, turn["out"], list(df.columns))
         except Exception as e:
             turn["error"] = f"{type(e).__name__}: {e}"
             turn["raw"] = raw
     history.append(turn)
     st.rerun()
-
-# ==========================================
-# 6. DATA PREVIEW (collapsed, out of the way)
-# ==========================================
-st.divider()
-with st.expander("Preview sheet & column summary"):
-    st.dataframe(df.head(50), use_container_width=True)
-    st.dataframe(pd.DataFrame(profile(df)), use_container_width=True)

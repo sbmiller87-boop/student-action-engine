@@ -75,3 +75,6 @@ def summarize(metas: list[dict], tz, now: datetime | None = None) -> dict:
     if stale:
         head += f" · ⚠️ some of this data hasn't been edited for {STALE_DAYS}+ days"
     return {"headline": head, "stale": stale, "rows": rows}
+
+
+VERSION = 6  # bump together with app.py REQUIRED_VERSION so stale copies are caught at startup

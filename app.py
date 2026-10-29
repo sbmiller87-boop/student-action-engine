@@ -249,6 +249,8 @@ Rules:
 - Choose the fewest files that can answer the question (maximum 10).
 - Use "all" only if the question is clearly about every file or the whole school across files.
 - For a follow-up question, keep using the previous files unless the question points elsewhere.
+- If it asks for different information (for example assessments or behaviours rather than attendance),
+  choose the file(s) whose columns contain that information, even if the previous question used another file.
 - File names often contain the year level, subject or term; match on those and on column names.
 - If it's ambiguous, pick the most plausible file(s) and say so in "reason".
 """
@@ -271,6 +273,7 @@ file each row came from. Respond with JSON only:
   "sort_by": str or null,
   "ascending": bool,
   "limit": int or null,
+  "use_previous_students": true | false,
   "note": "one line on how you interpreted the question"
 }}
 
@@ -285,6 +288,11 @@ Choose the intent:
 - "table": listing rows.
 For "aggregate" and "table", put all conditions in "filters" (leave "focus" empty).
 Use the conversation so far to resolve pronouns such as "his", "that class", "them".
+Set "use_previous_students" to true when the question refers to the students from the previous answer
+("those students", "them", "their", "those 5"). You are never shown who they are; the app restricts the
+data to them for you, so do not add filters to identify them.
+When listing students, include their name/ID columns in "select_columns" so staff can see who they are
+(you can't see the values, but the columns exist).
 Never answer with an error because of ambiguity: choose the most plausible reading and say so in "note".
 Only return {{"error": "reason"}} if the schema genuinely cannot answer the question.
 
@@ -408,6 +416,7 @@ with st.sidebar:
         st.rerun()
     if st.button("🧹 Clear conversation"):
         st.session_state["history"] = []
+        st.session_state.pop("cohort", None)
         st.rerun()
 
 # ==========================================
@@ -446,6 +455,8 @@ for i, turn in enumerate(history):
                            "placeholder before reaching the AI.")
             if turn.get("privacy_note"):
                 st.caption("⚠️ " + turn["privacy_note"])
+            if turn.get("cohort_note"):
+                st.caption("👥 " + turn["cohort_note"])
             st.caption(f"Interpreted as: {plan.get('note', '')}")
             if turn.get("narrative"):
                 st.markdown(turn["narrative"])
@@ -456,6 +467,9 @@ for i, turn in enumerate(history):
 
             if plan.get("intent", "table") == "table" or not out["figs"]:
                 st.write(f"**{len(out['result'])} result(s)**")
+                if len(out["result"]) == 0:
+                    st.info("No matching rows. Open 'Details' to see the query plan; the file may not hold this "
+                            "information, or those students may not appear in it.")
                 st.dataframe(out["result"], use_container_width=True)
             with st.expander("Details: data sources, tables, flags and query plan"):
                 st.markdown("**Data sources & timeliness**")
@@ -514,7 +528,22 @@ if question:
                 turn["error"] = privacy.unscrub(str(plan["error"]), name_map)
             else:
                 turn["plan"] = plan
-                turn["out"] = run_plan(df, plan, hidden)
+                run_df = df
+                if plan.get("use_previous_students"):
+                    cohort = st.session_state.get("cohort")
+                    if cohort is None:
+                        raise ValueError("I don't have a list of students from earlier in this chat. Ask for the "
+                                         "students first (for example 'list 5 students with ...'), then ask about them.")
+                    run_df, keys = privacy.restrict_to_cohort(df, cohort)
+                    turn["cohort_note"] = (f"Limited to the {len(cohort)} student(s) from your earlier list "
+                                           f"(matched on {', '.join(keys)}); {len(run_df):,} matching row(s) in this data.")
+                turn["out"] = run_plan(run_df, plan, hidden)
+                # Remember who a plain listing showed, so "those students" works next time.
+                if (not plan.get("use_previous_students") and plan.get("intent", "table") == "table"
+                        and not plan.get("aggregate")):
+                    c = privacy.cohort_from(df, turn["out"]["result"], hidden)
+                    if c is not None and len(c):
+                        st.session_state["cohort"] = c
                 narr, follow = wrapup(q_ai, plan_ai, turn["out"], list(df.columns))
                 turn["narrative"] = privacy.unscrub(narr, name_map)
                 turn["followups"] = [privacy.unscrub(f, name_map) for f in follow]

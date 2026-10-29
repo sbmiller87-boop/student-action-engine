@@ -22,7 +22,7 @@ BIGRAMS = {("first", "name"), ("last", "name"), ("given", "name"), ("full", "nam
            ("middle", "name"), ("preferred", "name"), ("legal", "name"), ("family", "name")}
 # Free-text columns routinely contain names
 FREE_TEXT = {"comment", "comments", "feedback", "remark", "remarks", "note", "notes"}
-EXACT = {("name",), ("id",), ("fullname",)}
+EXACT = {("name",), ("id",), ("fullname",), ("student",), ("pupil",), ("learner",)}
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -189,34 +189,83 @@ ID_TOKENS = {"id", "identifier", "number", "no"}
 NAME_TOKENS = {"name", "first", "last", "given", "surname", "firstname", "lastname", "middle", "preferred"}
 
 
-def cohort_from(df: pd.DataFrame, result: pd.DataFrame, hidden: set):
+FIRST_T = {"first", "given", "forename", "firstname", "givenname"}
+LAST_T = {"last", "surname", "family", "lastname", "familyname"}
+FULL_T = {"name", "fullname", "student", "pupil", "learner"}
+ID_T = ID_TOKENS | {"code", "sid"}
+NOT_STUDENT = {"teacher", "staff", "class", "subject", "task", "component", "school", "course", "campus"}
+
+
+def identity_roles(cols) -> dict:
+    """Which columns identify a student, by role, whatever the headers are called."""
+    r = {"id": [], "first": [], "last": [], "full": []}
+    for c in cols:
+        t = set(tokens(c))
+        if t & NOT_STUDENT:
+            continue
+        if t & ID_T:
+            r["id"].append(c)
+        elif t & LAST_T:
+            r["last"].append(c)
+        elif t & FIRST_T:
+            r["first"].append(c)
+        elif t & FULL_T:
+            r["full"].append(c)
+    return r
+
+
+def _name_key(*parts) -> str:
+    """Order-independent name key, so 'Smith, Jane' and 'Jane Smith' match."""
+    txt = " ".join(str(x) for x in parts if pd.notna(x)).lower().replace("’", "'")
+    return " ".join(sorted(re.findall(r"[a-z0-9']+", txt)))
+
+
+def _candidates(frame: pd.DataFrame, roles: dict) -> list:
+    """[(label, Series of match keys aligned to frame.index)] for each way this frame can identify a student."""
+    out = []
+    for c in roles["id"]:
+        k = frame[c].astype(str).str.strip().str.lower().str.replace(r"\.0$", "", regex=True)
+        out.append((c, k.where(frame[c].notna())))
+    if roles["first"] and roles["last"]:
+        f, l = roles["first"][0], roles["last"][0]
+        k = frame[[f, l]].apply(lambda r: _name_key(r.iloc[0], r.iloc[1]), axis=1)
+        out.append((f"{f} + {l}", k.where(frame[f].notna() & frame[l].notna())))
+    for c in roles["full"]:
+        out.append((c, frame[c].map(_name_key).where(frame[c].notna())))
+    return out
+
+
+def cohort_from(df: pd.DataFrame, result: pd.DataFrame, hidden: set = frozenset()):
     """Identity columns of the students in a plain listing (rows still carry their source-row index)."""
-    cols = [c for c in df.columns if c in hidden]
+    cols = [c for grp in identity_roles(df.columns).values() for c in grp]
     if not cols or result is None or len(result) == 0 or not result.index.isin(df.index).all():
         return None
     return df.loc[result.index, cols].drop_duplicates()
 
 
-def _match_columns(cohort_cols, df_cols) -> list:
-    shared = [c for c in cohort_cols if c in df_cols]
-    ids = [c for c in shared if set(tokens(c)) & ID_TOKENS]
-    return ids or [c for c in shared if set(tokens(c)) & NAME_TOKENS]
-
-
 def restrict_to_cohort(df: pd.DataFrame, cohort: pd.DataFrame):
-    """Rows of df belonging to the remembered students. Matches on an ID column if both files have one,
-    otherwise on name columns. Returns (rows, columns_used)."""
-    keys = _match_columns(list(cohort.columns), list(df.columns))
-    if not keys:
-        raise ValueError("I can't match those students to this data: it has no student ID or name column "
-                         "in common with the earlier list.")
+    """Rows of df belonging to the remembered students. Tries every ID/name combination both sides have
+    (IDs, first+last, full name) and uses whichever finds the most students. Returns (rows, [description])."""
+    cr, dr = identity_roles(cohort.columns), identity_roles(df.columns)
+    ckeys, dkeys = _candidates(cohort, cr), _candidates(df, dr)
+    best = None
+    for cl, cs in ckeys:
+        cset = set(cs.dropna())
+        for dl, ds_ in dkeys:
+            ok = ds_.isin(cset)
+            n = int(ok.sum())
+            if n and (best is None or n > best[0]):
+                best = (n, cl, dl, ok, len(cset), ds_[ok].nunique())
+    if best is None:
+        mine = [c for grp in dr.values() for c in grp]
+        raise ValueError(
+            "I couldn't find those students in this data. "
+            f"Identity columns in the earlier list: {', '.join(map(str, cohort.columns)) or 'none'}. "
+            f"Student ID/name columns I can see here: {', '.join(map(str, mine)) or 'none'}. "
+            "If these look like the same kind of information but the values differ (for example different "
+            "ID systems), they can't be matched.")
+    _, cl, dl, ok, total, found = best
+    return df.loc[ok], [f"{cl} \u2194 {dl}: {found} of {total} students found"]
 
-    def key(frame):
-        f = frame[keys].dropna()
-        k = f.astype(str).apply(lambda s: s.str.strip().str.lower().str.replace(r"\.0$", "", regex=True))
-        return k.agg("|".join, axis=1)
 
-    return df.loc[key(df).isin(set(key(cohort))).reindex(df.index, fill_value=False)], keys
-
-
-VERSION = 6  # bump together with app.py REQUIRED_VERSION so stale copies are caught at startup
+VERSION = 7  # bump together with app.py's required versions so stale copies are caught at startup

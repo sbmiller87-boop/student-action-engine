@@ -179,3 +179,41 @@ def unscrub(text: str, mapping: dict, json_safe: bool = False) -> str:
         rep = _json.dumps(orig)[1:-1] if json_safe else orig
         text = re.sub(re.escape(ph), lambda _m, r=rep: r, text, flags=re.I)
     return text
+
+
+# ---------------------------------------------------------------------------
+# "Those students": remember who a previous answer listed, locally, so follow-ups
+# can be restricted to them without the AI ever seeing who they are.
+# ---------------------------------------------------------------------------
+ID_TOKENS = {"id", "identifier", "number", "no"}
+NAME_TOKENS = {"name", "first", "last", "given", "surname", "firstname", "lastname", "middle", "preferred"}
+
+
+def cohort_from(df: pd.DataFrame, result: pd.DataFrame, hidden: set):
+    """Identity columns of the students in a plain listing (rows still carry their source-row index)."""
+    cols = [c for c in df.columns if c in hidden]
+    if not cols or result is None or len(result) == 0 or not result.index.isin(df.index).all():
+        return None
+    return df.loc[result.index, cols].drop_duplicates()
+
+
+def _match_columns(cohort_cols, df_cols) -> list:
+    shared = [c for c in cohort_cols if c in df_cols]
+    ids = [c for c in shared if set(tokens(c)) & ID_TOKENS]
+    return ids or [c for c in shared if set(tokens(c)) & NAME_TOKENS]
+
+
+def restrict_to_cohort(df: pd.DataFrame, cohort: pd.DataFrame):
+    """Rows of df belonging to the remembered students. Matches on an ID column if both files have one,
+    otherwise on name columns. Returns (rows, columns_used)."""
+    keys = _match_columns(list(cohort.columns), list(df.columns))
+    if not keys:
+        raise ValueError("I can't match those students to this data: it has no student ID or name column "
+                         "in common with the earlier list.")
+
+    def key(frame):
+        f = frame[keys].dropna()
+        k = f.astype(str).apply(lambda s: s.str.strip().str.lower().str.replace(r"\.0$", "", regex=True))
+        return k.agg("|".join, axis=1)
+
+    return df.loc[key(df).isin(set(key(cohort))).reindex(df.index, fill_value=False)], keys

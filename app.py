@@ -336,11 +336,17 @@ that makes sense on its own (name the group, file or column; never say "it" or "
 the available columns, and varied: one to drill down, one to compare, one to check data quality or consistency.
 """
 
-NARRATE_RULE = ("3 to 6 short markdown bullet points: what the results show, and anything inconsistent or "
-                "worth a closer look, each backed by a specific number. Then one final line of caveats "
-                "(for example small samples, marks possibly on different scales across tasks, peers possibly "
-                "teaching different cohorts). Frame findings as 'worth a look', never as accusations about a "
-                "person. Plain English, no preamble, no headings.")
+NARRATE_RULE = ("Talk like a helpful colleague. Start with one plain-English sentence that directly answers "
+                "the question. Then 2 to 4 short markdown bullet points on what stands out or is worth a closer "
+                "look, each backed by a specific number. Finish with one short line of caveats (for example small "
+                "samples, marks possibly on different scales across tasks, peers possibly teaching different "
+                "cohorts). Frame findings as 'worth a look', never as accusations about a person. No headings and "
+                "no preamble such as 'Here is'.")
+
+LIST_RULE = ("one or two friendly sentences introducing the table the person is about to see. You cannot see the "
+             "rows, so only mention how many rows there are and what columns they have; never invent names, "
+             "values or findings.")
+
 
 def get_starters(items: list[dict]) -> list[str]:
     """Example questions built locally from file names. No AI call, so the page never waits on Gemini."""
@@ -382,22 +388,22 @@ def choose_entries(question: str, history: list[dict]) -> tuple[list[dict], str]
 
 
 def wrapup(question: str, plan: dict, out: dict, columns: list[str]) -> tuple[str, list[str]]:
-    """One call returns commentary (for analyses) and 3 follow-up ideas. Never fails the answer."""
+    """One call returns a conversational reply and 3 follow-up ideas. Never fails the answer."""
     intent = plan.get("intent", "table")
-    narrate = intent in ("distribution", "aggregate") and out["summary"]
-    if narrate:
+    analysis_ = bool(intent in ("distribution", "aggregate") and out["summary"])
+    if analysis_:
         summary, rule = out["summary"], NARRATE_RULE
     else:  # listings: send only the shape, never student rows
         summary = f"A table of {len(out['result'])} rows with columns: {', '.join(map(str, out['result'].columns))}."
-        rule = 'an empty string ("").'
+        rule = LIST_RULE
     try:
         r = extract_json(call_model(WRAPUP_PROMPT.format(
             question=question, intent=intent, columns=", ".join(columns[:60]),
             summary=summary, commentary_rule=rule)))
         follow = [x for x in r.get("followups", []) if isinstance(x, str)][:3]
-        return (r.get("commentary") or "") if narrate else "", follow
+        return r.get("commentary") or "", follow
     except Exception:
-        return "", []
+        return ("" if analysis_ else f"Here's what I found: {len(out['result'])} result(s)."), []
 
 
 # ==========================================
@@ -436,130 +442,158 @@ with st.sidebar:
 st.title("💬 Student Insights Assistant")
 
 history: list[dict] = st.session_state.setdefault("history", [])
+question = st.chat_input("Ask about your school data...") or st.session_state.pop("pending_q", None)
 
-if not history:
-    st.write("Ask anything about your school data. Try one of these:")
-    for k, s in enumerate(get_starters(entries)):
-        st.button(s, key=f"starter_{k}", on_click=ask, args=(s,))
+if not history and not question:
+    st.write("Hi! Ask me anything about your school data, or try one of these:")
+    for k, s_ in enumerate(get_starters(entries)):
+        st.button(s_, key=f"starter_{k}", on_click=ask, args=(s_,))
 
-for i, turn in enumerate(history):
+
+def render_turn(i: int, turn: dict, is_last: bool):
     with st.chat_message("user"):
         st.write(turn["question"])
     with st.chat_message("assistant"):
         if turn.get("error"):
             st.error(turn["error"])
-            if turn.get("raw"):
-                with st.expander("Raw AI response"):
-                    st.code(turn["raw"])
-        else:
-            out, plan, fresh = turn["out"], turn["plan"], turn["fresh"]
-            used = ", ".join(m["label"] for m in turn["metas"][:3])
-            if len(turn["metas"]) > 3:
-                used += f" and {len(turn['metas']) - 3} more"
-            st.caption(f"📂 Using: {used}" + (f" ({turn['reason']})" if turn.get("reason") else ""))
-            st.caption(fresh["headline"])
-            if turn.get("hidden"):
-                st.caption("🔒 Kept from the AI (values never sent): " + ", ".join(turn["hidden"][:8])
-                           + (f" +{len(turn['hidden']) - 8} more" if len(turn["hidden"]) > 8 else ""))
+            return
+        out, plan, fresh = turn["out"], turn["plan"], turn["fresh"]
+
+        # 1. the reply itself, conversational and first
+        if turn.get("narrative"):
+            st.markdown(turn["narrative"])
+        for n in out["notes"]:
+            st.caption(f"ℹ️ {n}")
+        for j, fig in enumerate(out["figs"]):
+            st.plotly_chart(fig, use_container_width=True, key=f"fig_{i}_{j}")
+        if plan.get("intent", "table") == "table" or not out["figs"]:
+            if len(out["result"]) == 0:
+                st.info("I didn't find any matching rows. The file may not hold this information, or those "
+                        "students may not appear in it. Open 'How I worked this out' to see what I searched for.")
+            st.dataframe(out["result"], use_container_width=True)
+        if len(out["result"]):
+            st.download_button("Download table (CSV)", out["result"].to_csv(index=False),
+                               f"result_{i}.csv", key=f"dl_{i}")
+
+        # 2. where it came from and how fresh it is
+        used = ", ".join(m["label"] for m in turn["metas"][:3])
+        if len(turn["metas"]) > 3:
+            used += f" and {len(turn['metas']) - 3} more"
+        st.caption(f"📂 {used}" + (f" ({turn['reason']})" if turn.get("reason") else ""))
+        st.caption(fresh["headline"])
+        if turn.get("cohort_note"):
+            st.caption("👥 " + turn["cohort_note"])
+        if turn.get("privacy_note"):
+            st.caption("⚠️ " + turn["privacy_note"])
+
+        # 3. the technical detail, tucked away
+        with st.expander("How I worked this out"):
+            st.write(f"I read your question as: {plan.get('note', '')}")
             if turn.get("masked"):
-                st.caption(f"🔒 {turn['masked']} student name/ID in your question was replaced with a "
-                           "placeholder before reaching the AI.")
-            if turn.get("privacy_note"):
-                st.caption("⚠️ " + turn["privacy_note"])
-            if turn.get("cohort_note"):
-                st.caption("👥 " + turn["cohort_note"])
-            st.caption(f"Interpreted as: {plan.get('note', '')}")
-            if turn.get("narrative"):
-                st.markdown(turn["narrative"])
-            for n in out["notes"]:
-                st.caption(f"ℹ️ {n}")
-            for j, fig in enumerate(out["figs"]):
-                st.plotly_chart(fig, use_container_width=True, key=f"fig_{i}_{j}")
-
-            if plan.get("intent", "table") == "table" or not out["figs"]:
-                st.write(f"**{len(out['result'])} result(s)**")
-                if len(out["result"]) == 0:
-                    st.info("No matching rows. Open 'Details' to see the query plan; the file may not hold this "
-                            "information, or those students may not appear in it.")
+                st.write(f"🔒 {turn['masked']} student name/ID in your question was replaced with a "
+                         "placeholder before reaching the AI.")
+            if turn.get("hidden"):
+                st.write("🔒 Kept from the AI (values never sent): " + ", ".join(turn["hidden"][:8])
+                         + (f" +{len(turn['hidden']) - 8} more" if len(turn["hidden"]) > 8 else ""))
+            st.markdown("**Data sources & timeliness**")
+            st.dataframe(pd.DataFrame(fresh["rows"]), use_container_width=True)
+            if turn.get("skipped"):
+                st.markdown("**Skipped files**\n\n" + "\n".join(f"- {x}" for x in turn["skipped"]))
+            if out["flags"]:
+                st.markdown("**Automatic flags**\n\n" + "\n".join(f"- {f}" for f in out["flags"]))
+            if out["stats"] is not None:
+                st.dataframe(out["stats"], use_container_width=True)
+            if out["levels"] is not None:
+                st.dataframe(out["levels"], use_container_width=True)
+            if plan.get("intent", "table") != "table" and out["figs"]:
                 st.dataframe(out["result"], use_container_width=True)
-            with st.expander("Details: data sources, tables, flags and query plan"):
-                st.markdown("**Data sources & timeliness**")
-                st.dataframe(pd.DataFrame(fresh["rows"]), use_container_width=True)
-                if turn.get("skipped"):
-                    st.markdown("**Skipped files**\n\n" + "\n".join(f"- {x}" for x in turn["skipped"]))
-                if out["flags"]:
-                    st.markdown("**Automatic flags**\n\n" + "\n".join(f"- {f}" for f in out["flags"]))
-                if out["stats"] is not None:
-                    st.dataframe(out["stats"], use_container_width=True)
-                if out["levels"] is not None:
-                    st.dataframe(out["levels"], use_container_width=True)
-                if plan.get("intent", "table") != "table" and out["figs"]:
-                    st.dataframe(out["result"], use_container_width=True)
-                st.json(plan)
-            if len(out["result"]):
-                st.download_button("Download table (CSV)", out["result"].to_csv(index=False),
-                                   f"result_{i}.csv", key=f"dl_{i}")
+            st.json(plan)
 
-            if i == len(history) - 1 and turn.get("followups"):
-                st.markdown("**Ideas to explore next**")
-                for k, f in enumerate(turn["followups"]):
-                    st.button(f, key=f"fu_{i}_{k}", on_click=ask, args=(f,))
+        # 4. what to ask next
+        if is_last and turn.get("followups"):
+            st.markdown("**Want to dig deeper?**")
+            for k, f in enumerate(turn["followups"]):
+                st.button(f, key=f"fu_{i}_{k}", on_click=ask, args=(f,))
 
-question = st.chat_input("Ask about your school data...") or st.session_state.pop("pending_q", None)
+
+for i, turn in enumerate(history):
+    render_turn(i, turn, is_last=(i == len(history) - 1))
+
+
+def answer(question: str, status) -> dict:
+    """Everything that happens after a question is asked. `status` shows live progress to the person."""
+    turn = {"question": question}
+    try:
+        # Step 0: mask names/IDs in the question BEFORE any AI call (routing included).
+        status.write("🔒 Checking for student names...")
+        index, failed, over = get_name_index(tuple((e["id"], e["modified"] or "") for e in entries))
+        q_ai, name_map = privacy.scrub(question, index, privacy.vocab_words(entries))
+        turn.update(question_ai=q_ai, masked=len(name_map))
+        if failed or over:
+            n = len(failed) + over
+            turn["privacy_note"] = (f"{n} file(s) couldn't be checked for student names, so names that "
+                                    "only appear in those files weren't masked.")
+
+        status.write("🔎 Finding the right data...")
+        chosen, reason = choose_entries(q_ai, history)
+        status.write("📥 Reading " + ", ".join(e["label"] for e in chosen[:3])
+                     + (f" and {len(chosen) - 3} more" if len(chosen) > 3 else "") + "...")
+        df, prof, metas, skipped = load_selection(chosen)
+        hidden = privacy.detect_sensitive(df, HIDE_COLS, ALLOW_COLS)
+        turn.update(hidden=sorted(map(str, hidden)), entry_ids=[e["id"] for e in chosen], reason=reason,
+                    metas=metas, skipped=skipped, fresh=freshness.summarize(metas, TZ))
+
+        status.write("🧠 Working out how to answer...")
+        raw = call_model(PLAN_PROMPT.format(
+            history=history_text(history),
+            schema=json.dumps(privacy.safe_profile(prof, hidden), default=str),
+            sample=privacy.safe_sample(df, hidden),
+            question=q_ai,
+        ))
+        plan_ai = extract_json(raw)                      # what the AI said (placeholders)
+        turn["note_ai"] = str(plan_ai.get("note", ""))
+        plan = extract_json(privacy.unscrub(raw, name_map, json_safe=True))  # real values, local use only
+        if "error" in plan:
+            turn["error"] = privacy.unscrub(str(plan["error"]), name_map)
+            return turn
+
+        turn["plan"] = plan
+        run_df = df
+        if plan.get("use_previous_students"):
+            cohort = st.session_state.get("cohort")
+            if cohort is None:
+                raise ValueError("I don't have a list of students from earlier in this chat. Ask for the "
+                                 "students first (for example 'list 5 students with ...'), then ask about them.")
+            run_df, keys = privacy.restrict_to_cohort(df, cohort)
+            turn["cohort_note"] = (f"Limited to the {len(cohort)} student(s) from your earlier list "
+                                   f"(matched on {', '.join(keys)}); {len(run_df):,} matching row(s) in this data.")
+        status.write("📊 Running the numbers...")
+        turn["out"] = run_plan(run_df, plan, hidden)
+        # Remember who a plain listing showed, so "those students" works next time.
+        if (not plan.get("use_previous_students") and plan.get("intent", "table") == "table"
+                and not plan.get("aggregate")):
+            c = privacy.cohort_from(df, turn["out"]["result"], hidden)
+            if c is not None and len(c):
+                st.session_state["cohort"] = c
+
+        status.write("✍️ Writing it up...")
+        narr, follow = wrapup(q_ai, plan_ai, turn["out"], list(df.columns))
+        turn["narrative"] = privacy.unscrub(narr, name_map)
+        turn["followups"] = [privacy.unscrub(f, name_map) for f in follow]
+    except Exception as e:
+        turn["error"] = f"{type(e).__name__}: {e}"
+    return turn
+
 
 if question:
-    turn, raw = {"question": question}, None
-    with st.spinner("Working on it..."):
-        try:
-            # Step 0: mask names/IDs in the question BEFORE any AI call (routing included).
-            index, failed, over = get_name_index(tuple((e["id"], e["modified"] or "") for e in entries))
-            q_ai, name_map = privacy.scrub(question, index, privacy.vocab_words(entries))
-            turn.update(question_ai=q_ai, masked=len(name_map))
-            if failed or over:
-                n = len(failed) + over
-                turn["privacy_note"] = (f"{n} file(s) couldn't be checked for student names, so names that "
-                                        "only appear in those files weren't masked.")
-
-            chosen, reason = choose_entries(q_ai, history)
-            df, prof, metas, skipped = load_selection(chosen)
-            hidden = privacy.detect_sensitive(df, HIDE_COLS, ALLOW_COLS)
-            turn.update(hidden=sorted(map(str, hidden)), entry_ids=[e["id"] for e in chosen], reason=reason,
-                        metas=metas, skipped=skipped, fresh=freshness.summarize(metas, TZ))
-
-            raw = call_model(PLAN_PROMPT.format(
-                history=history_text(history),
-                schema=json.dumps(privacy.safe_profile(prof, hidden), default=str),
-                sample=privacy.safe_sample(df, hidden),
-                question=q_ai,
-            ))
-            plan_ai = extract_json(raw)                      # what the AI said (placeholders)
-            turn["note_ai"] = str(plan_ai.get("note", ""))
-            plan = extract_json(privacy.unscrub(raw, name_map, json_safe=True))  # real values, local use only
-            if "error" in plan:
-                turn["error"] = privacy.unscrub(str(plan["error"]), name_map)
-            else:
-                turn["plan"] = plan
-                run_df = df
-                if plan.get("use_previous_students"):
-                    cohort = st.session_state.get("cohort")
-                    if cohort is None:
-                        raise ValueError("I don't have a list of students from earlier in this chat. Ask for the "
-                                         "students first (for example 'list 5 students with ...'), then ask about them.")
-                    run_df, keys = privacy.restrict_to_cohort(df, cohort)
-                    turn["cohort_note"] = (f"Limited to the {len(cohort)} student(s) from your earlier list "
-                                           f"(matched on {', '.join(keys)}); {len(run_df):,} matching row(s) in this data.")
-                turn["out"] = run_plan(run_df, plan, hidden)
-                # Remember who a plain listing showed, so "those students" works next time.
-                if (not plan.get("use_previous_students") and plan.get("intent", "table") == "table"
-                        and not plan.get("aggregate")):
-                    c = privacy.cohort_from(df, turn["out"]["result"], hidden)
-                    if c is not None and len(c):
-                        st.session_state["cohort"] = c
-                narr, follow = wrapup(q_ai, plan_ai, turn["out"], list(df.columns))
-                turn["narrative"] = privacy.unscrub(narr, name_map)
-                turn["followups"] = [privacy.unscrub(f, name_map) for f in follow]
-        except Exception as e:
-            turn["error"] = f"{type(e).__name__}: {e}"
-            turn["raw"] = None  # raw AI text may hold placeholders only, but never needed for display
+    # Show the question straight away, then think out loud while working.
+    with st.chat_message("user"):
+        st.write(question)
+    with st.chat_message("assistant"):
+        with st.status("Thinking...", expanded=True) as status:
+            turn = answer(question, status)
+            failed_ = bool(turn.get("error"))
+            status.update(label="Something went wrong" if failed_ else "Done",
+                          state="error" if failed_ else "complete", expanded=failed_)
     history.append(turn)
     st.rerun()

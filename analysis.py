@@ -297,3 +297,6 @@ def _distribution(df, plan, hidden):
     summary += "\nAutomatic flags:\n" + ("\n".join(flags_ai[:20]) if flags_ai else "none")
     summary += "\nNotes:\n" + "\n".join(notes)
     return dict(result=result, figs=figs, stats=stats, levels=levels, flags=flags, notes=notes, summary=summary)
+
+
+VERSION = 6  # bump together with app.py REQUIRED_VERSION so stale copies are caught at startup

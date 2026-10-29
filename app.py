@@ -16,10 +16,9 @@ import freshness
 import privacy
 
 # Catch out-of-date files up front (a common slip when updating files one at a time on GitHub).
-REQUIRED_VERSION = 6
-_stale = [n for n, m in [("analysis.py", analysis), ("privacy.py", privacy),
-                         ("drive_sources.py", ds), ("freshness.py", freshness)]
-          if getattr(m, "VERSION", 0) != REQUIRED_VERSION]
+REQUIRED_VERSIONS = [("analysis.py", analysis, 6), ("privacy.py", privacy, 7),
+                     ("drive_sources.py", ds, 6), ("freshness.py", freshness, 6)]
+_stale = [n for n, m, v in REQUIRED_VERSIONS if getattr(m, "VERSION", 0) < v]
 if _stale:
     st.error("These files in your repo are out of date: **" + ", ".join(_stale) + "**. Replace each with the "
              "latest copy (same folder as app.py, exact filenames), commit, then Reboot app.")
